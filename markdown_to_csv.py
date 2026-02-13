@@ -13,6 +13,9 @@ them to a CSV file with the following columns:
 - Rate
 - Adj. Basis
 - Total Invoiced
+- Supplier ID
+- Invoice No
+- Create Date
 """
 
 import re
@@ -36,6 +39,42 @@ def extract_page_number(text: str) -> int:
     return None
 
 
+def extract_metadata(lines: list) -> dict:
+    """
+    Extract metadata from the markdown file header.
+    
+    Returns a dict with:
+        - supplier_id: Supplier ID
+        - invoice_no: Invoice Number
+        - create_date: Invoice Create Date range
+    """
+    metadata = {
+        'supplier_id': '',
+        'invoice_no': '',
+        'create_date': ''
+    }
+    
+    # Search in the first 30 lines for metadata
+    for line in lines[:30]:
+        line = line.strip()
+        
+        # Extract Create Date from "For Invoice Create Date DD/MM/YYYY To DD/MM/YYYY"
+        if 'For Invoice Create Date' in line:
+            match = re.search(r'For Invoice Create Date\s+(\d{2}/\d{2}/\d{4}\s+To\s+\d{2}/\d{2}/\d{4})', line)
+            if match:
+                metadata['create_date'] = match.group(1)
+        
+        # Extract Supplier ID (matches exactly 10 digits on a line)
+        if re.match(r'^\d{10}$', line):
+            metadata['supplier_id'] = line
+        
+        # Extract Invoice No (matches exactly 8 digits on a line)
+        if re.match(r'^\d{8}$', line):
+            metadata['invoice_no'] = line
+    
+    return metadata
+
+
 def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
     """
     Parse Markdown invoice file and convert to CSV.
@@ -46,6 +85,9 @@ def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
     """
     with open(markdown_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
+    
+    # Extract metadata from the file header
+    metadata = extract_metadata(lines)
     
     # CSV output
     csv_rows = []
@@ -123,7 +165,10 @@ def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
                     'EM Sales Qty': em_sales_qty,
                     'Rate': rate,
                     'Adj. Basis': adj_basis,
-                    'Total Invoiced': total_invoiced
+                    'Total Invoiced': total_invoiced,
+                    'Supplier ID': metadata['supplier_id'],
+                    'Invoice No': metadata['invoice_no'],
+                    'Create Date': metadata['create_date']
                 })
         else:
             # Not in table anymore
@@ -145,7 +190,10 @@ def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
             'EM Sales Qty',
             'Rate',
             'Adj. Basis',
-            'Total Invoiced'
+            'Total Invoiced',
+            'Supplier ID',
+            'Invoice No',
+            'Create Date'
         ]
         
         with open(csv_file, 'w', newline='', encoding='utf-8') as f:
