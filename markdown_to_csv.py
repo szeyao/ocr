@@ -24,19 +24,9 @@ import sys
 from pathlib import Path
 
 
-def extract_page_number(text: str) -> int:
-    """Extract page number from text like '/ 4 14' or 'Page 4'."""
-    # Pattern: "/ X 14" where X is the page number
-    match = re.search(r'/\s*(\d+)\s+14', text)
-    if match:
-        return int(match.group(1))
-    
-    # Pattern: "Page X"
-    match = re.search(r'Page\s*(\d+)', text)
-    if match:
-        return int(match.group(1))
-    
-    return None
+def is_page_boundary(text: str) -> bool:
+    """Detect a page boundary via the <!-- image --> marker between pages."""
+    return '<!-- image -->' in text
 
 
 def extract_metadata(lines: list) -> dict:
@@ -93,7 +83,9 @@ def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
     csv_rows = []
     
     # State tracking
-    current_page = 1
+    # Page counter starts at 0; it is incremented each time we encounter a
+    # <!-- image --> marker, which appears at the top of every page section.
+    current_page = 0
     in_table = False
     current_product_code = ""
     current_product_desc = ""
@@ -102,10 +94,16 @@ def parse_markdown_to_csv(markdown_file: Path, csv_file: Path):
     while i < len(lines):
         line = lines[i].strip()
         
-        # Extract page number
-        page_num = extract_page_number(line)
-        if page_num:
-            current_page = page_num
+        # Detect page boundary: <!-- image --> appears once per page at the top.
+        # We increment the page number here so that all table rows that follow
+        # are tagged with the correct page number.
+        if is_page_boundary(line):
+            current_page += 1
+            in_table = False
+            current_product_code = ""
+            current_product_desc = ""
+            i += 1
+            continue
         
         # Detect table separator (e.g., |---|---|)
         if re.match(r'^\s*\|[\s\-:|]+\|\s*$', line):
