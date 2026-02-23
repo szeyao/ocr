@@ -1,15 +1,11 @@
 import shutil
-import os
-import uuid
 import sys
+import uuid
 import json
 import asyncio
-import functools
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from run_pipeline import run_pipeline
 
 # Ensure the current directory is in sys.path
 sys.path.append(str(Path(__file__).parent))
@@ -20,8 +16,8 @@ app = FastAPI(title="Invoice Processing API")
 OUTPUT_ROOT = Path("processed_outputs")
 OUTPUT_ROOT.mkdir(exist_ok=True)
 
-# Thread pool for running the blocking pipeline in a non-blocking way
-_executor = ThreadPoolExecutor()
+# Python executable to use (same interpreter that started api.py)
+PYTHON = sys.executable
 
 
 @app.get("/", include_in_schema=False)
@@ -32,12 +28,16 @@ async def root():
 @app.post("/process-invoice/")
 async def process_invoice(request: Request, file: UploadFile = File(...)):
     """
-    1. Saves file to unique dir.
-    2. Runs pipeline in a thread, monitoring for client disconnection.
-    3. Returns both processed and validation JSON data.
+    1. Saves the uploaded PDF to a unique directory.
+    2. Runs the pipeline as a *subprocess* so it can be truly killed if the
+       client disconnects (threads cannot be force-stopped; subprocesses can).
+    3. Returns both processed_data and validation_data as JSON.
 
-    If the client disconnects before the pipeline finishes, the endpoint
-    returns early and the output directory is cleaned up.
+    Cancellation behaviour
+    ─────────────────────
+    The endpoint polls for client disconnection every 0.5 s.  If the client
+    drops (browser closed, network lost, etc.) the subprocess is sent SIGTERM
+    (or taskkill on Windows) and the output directory is deleted.
     """
 
     job_id = str(uuid.uuid4())
@@ -46,74 +46,88 @@ async def process_invoice(request: Request, file: UploadFile = File(...)):
 
     pdf_path = temp_dir / file.filename
 
-    # 1. Save Uploaded File
+    # ── 1. Save uploaded file ────────────────────────────────────────────────
     try:
-        with open(pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        contents = await file.read()
+        pdf_path.write_bytes(contents)
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    # 2. Run Pipeline – in a thread so we can watch for client disconnect
-    loop = asyncio.get_event_loop()
+    # ── 2. Launch pipeline as a subprocess ──────────────────────────────────
+    proc = await asyncio.create_subprocess_exec(
+        PYTHON, "run_pipeline.py", str(pdf_path), "-o", str(temp_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,   # merge stderr into stdout
+        cwd=str(Path(__file__).parent),
+    )
 
-    # Submit the blocking pipeline call to the thread-pool
-    pipeline_fn = functools.partial(run_pipeline, str(pdf_path), output_dir=str(temp_dir))
-    future = loop.run_in_executor(_executor, pipeline_fn)
+    async def kill_and_cleanup():
+        """Terminate the subprocess and remove its output directory."""
+        try:
+            proc.kill()          # SIGKILL – immediate on Windows & Unix
+            await proc.wait()
+        except Exception:
+            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
+    # ── 3. Wait for subprocess, polling for client disconnect ────────────────
     try:
-        while not future.done():
-            # Check whether the client has disconnected
+        while proc.returncode is None:
             if await request.is_disconnected():
-                # Cancel the future (best-effort; the thread may still finish)
-                future.cancel()
-                shutil.rmtree(temp_dir, ignore_errors=True)
+                await kill_and_cleanup()
                 raise HTTPException(
                     status_code=499,
-                    detail="Client disconnected – pipeline cancelled."
+                    detail="Client disconnected – pipeline was cancelled and cleaned up."
                 )
-            # Poll every 0.5 s so we are responsive to disconnects
-            await asyncio.sleep(0.5)
-
-        # Retrieve the result (re-raises any exception thrown in the thread)
-        success = await future
+            # Give the subprocess 0.5 s then re-check
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass   # subprocess still running – loop again
 
     except HTTPException:
-        raise  # Re-raise cancellation HTTPException as-is
-    except asyncio.CancelledError:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=499, detail="Request was cancelled.")
+        raise
     except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        await kill_and_cleanup()
         raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
 
-    if not success:
+    # ── 4. Check exit code ───────────────────────────────────────────────────
+    if proc.returncode != 0:
+        # Capture any output for the error message
+        stdout_bytes = b""
+        if proc.stdout:
+            try:
+                stdout_bytes = await asyncio.wait_for(proc.stdout.read(), timeout=2)
+            except Exception:
+                pass
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="Pipeline failed to process the invoice.")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline failed (exit {proc.returncode}): "
+                   f"{stdout_bytes.decode(errors='replace')[-500:]}"
+        )
 
-    # 3. Locate the JSON files
+    # ── 5. Locate output JSON files ──────────────────────────────────────────
     base_name = Path(file.filename).stem
     processed_json_path = temp_dir / f"{base_name}_processed.json"
     validation_json_path = temp_dir / f"{base_name}_validation.json"
 
-    # 4. Read and Return JSON Data
+    # ── 6. Read and return ───────────────────────────────────────────────────
     try:
         if not processed_json_path.exists():
             raise HTTPException(status_code=404, detail="Processed JSON not found.")
         if not validation_json_path.exists():
             raise HTTPException(status_code=404, detail="Validation JSON not found.")
 
-        with open(processed_json_path, 'r', encoding='utf-8') as f:
-            processed_data = json.load(f)
-
-        with open(validation_json_path, 'r', encoding='utf-8') as f:
-            validation_data = json.load(f)
+        processed_data = json.loads(processed_json_path.read_text(encoding="utf-8"))
+        validation_data = json.loads(validation_json_path.read_text(encoding="utf-8"))
 
         return JSONResponse(content={
             "status": "success",
             "job_id": job_id,
             "processed_data": processed_data,
-            "validation_data": validation_data
+            "validation_data": validation_data,
         })
 
     except HTTPException:
@@ -121,7 +135,7 @@ async def process_invoice(request: Request, file: UploadFile = File(...)):
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse JSON: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading JSON files: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading output files: {e}")
 
 
 if __name__ == "__main__":
