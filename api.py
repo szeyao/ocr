@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import sys
 import uuid
 import json
@@ -55,41 +56,47 @@ async def process_invoice(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
     # ── 2. Launch pipeline as a subprocess ──────────────────────────────────
-    proc = await asyncio.create_subprocess_exec(
-        PYTHON, "run_pipeline.py", str(pdf_path), "-o", str(temp_dir),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,   # merge stderr into stdout
+    # Use subprocess.Popen instead of asyncio.create_subprocess_exec because
+    # the latter raises NotImplementedError on Windows under uvicorn's reloader.
+    proc = subprocess.Popen(
+        [PYTHON, "run_pipeline.py", str(pdf_path), "-o", str(temp_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge stderr into stdout
         cwd=str(Path(__file__).parent),
     )
 
-    async def kill_and_cleanup():
+    def kill_and_cleanup():
         """Terminate the subprocess and remove its output directory."""
         try:
-            proc.kill()          # SIGKILL – immediate on Windows & Unix
-            await proc.wait()
+            proc.kill()
+            proc.wait(timeout=5)
         except Exception:
             pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ── 3. Wait for subprocess, polling for client disconnect ────────────────
+    loop = asyncio.get_event_loop()
     try:
-        while proc.returncode is None:
+        while proc.poll() is None:
             if await request.is_disconnected():
-                await kill_and_cleanup()
+                await loop.run_in_executor(None, kill_and_cleanup)
                 raise HTTPException(
                     status_code=499,
                     detail="Client disconnected – pipeline was cancelled and cleaned up."
                 )
             # Give the subprocess 0.5 s then re-check
             try:
-                await asyncio.wait_for(proc.wait(), timeout=0.5)
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, proc.wait, 0.5),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
                 pass   # subprocess still running – loop again
 
     except HTTPException:
         raise
     except Exception as e:
-        await kill_and_cleanup()
+        await loop.run_in_executor(None, kill_and_cleanup)
         raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
 
     # ── 4. Check exit code ───────────────────────────────────────────────────
@@ -98,7 +105,7 @@ async def process_invoice(request: Request, file: UploadFile = File(...)):
         stdout_bytes = b""
         if proc.stdout:
             try:
-                stdout_bytes = await asyncio.wait_for(proc.stdout.read(), timeout=2)
+                stdout_bytes = proc.stdout.read()
             except Exception:
                 pass
         shutil.rmtree(temp_dir, ignore_errors=True)
